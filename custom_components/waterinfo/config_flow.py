@@ -2,15 +2,13 @@
 
 from __future__ import annotations
 
-from datetime import datetime as dt, timedelta
 import logging
-import random
-import string
+from datetime import datetime as dt
+from datetime import timedelta
 from typing import Any
 
 import ddlpy
 import voluptuous as vol
-
 from homeassistant.config_entries import (
     ConfigEntry,
     ConfigFlow,
@@ -44,6 +42,7 @@ from .const import (
     OPT_TIMEDELTA,
 )
 from .locations import CONF_LOC_OPTIONS
+from .tide import has_wathteverwacht
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -125,6 +124,7 @@ def validate_location(data) -> dict:
                 device_info[CONST_PROCES_TYPE] = "astronomisch"
                 device_info[CONST_ENABLE] = 0
             elif grootheid in ("WATHTEVERWACHT", "QVERWACHT"):
+                # This "grootheid" seems not really supported by the ddlpy library (bug in RWS API)
                 device_info[CONST_PROCES_TYPE] = "verwacht"
                 device_info[CONST_ENABLE] = 0
             else:
@@ -142,6 +142,34 @@ def validate_location(data) -> dict:
                 # if not, disabled
                 if measurements.empty:
                     device_info[CONST_ENABLE] = 0
+                else:
+                    if has_wathteverwacht(selected.iloc[x], data[CONST_LOC_CODE]):
+                        _LOGGER.info(
+                            "Location %s has WATHTEVERWACHT available",
+                            selected.iloc[x]["Naam"],
+                        )
+
+                        # Create high tide sensor
+                        high_tide_info = device_info.copy()
+                        high_tide_info[CONST_MEAS_CODE] = "WATHTEVERWACHT_HW"
+                        high_tide_info[CONST_MEAS_NAME] = "Verwacht hoogwater"
+                        high_tide_info[CONST_MEAS_DESCR] = "Astronomische hoogwater voorspelling"
+                        high_tide_info[CONST_SENSOR_UNIQUE] = "WATHTEVERWACHT_HW"
+                        high_tide_info[CONST_PROCES_TYPE] = "verwacht"
+                        high_tide_info[CONST_ENABLE] = 1
+                        seen.append("WATHTEVERWACHT_HW")
+                        sensoren.append(high_tide_info)
+
+                        # Create low tide height sensor
+                        low_tide_info = device_info.copy()
+                        low_tide_info[CONST_MEAS_CODE] = "WATHTEVERWACHT_LW"
+                        low_tide_info[CONST_MEAS_NAME] = "Verwacht laagwater"
+                        low_tide_info[CONST_MEAS_DESCR] = "Astronomische laagwater voorspelling"
+                        low_tide_info[CONST_SENSOR_UNIQUE] = "WATHTEVERWACHT_LW"
+                        low_tide_info[CONST_PROCES_TYPE] = "verwacht"
+                        low_tide_info[CONST_ENABLE] = 1
+                        seen.append("WATHTEVERWACHT_LW")
+                        sensoren.append(low_tide_info)
 
             seen.append(sensorKey)
             sensoren.append(device_info)

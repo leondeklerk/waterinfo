@@ -7,7 +7,6 @@ import logging
 
 import ddlpy
 import pandas as pd
-
 from homeassistant.components.sensor import (
     SensorDeviceClass,
     SensorEntity,
@@ -38,6 +37,7 @@ from .const import (
     CONST_UNIT,
     DOMAIN,
 )
+from .tide import get_wathteverwacht
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -134,6 +134,14 @@ class WaterInfoMetingSensor(SensorEntity):
             self._attr_native_unit_of_measurement = entry[CONST_UNIT]
             self._attr_icon = "mdi:format-line-height"
             self._attr_device_class = SensorDeviceClass.DISTANCE
+        elif entry[CONST_MEAS_CODE] == "WATHTEVERWACHT_HW":
+            self._attr_native_unit_of_measurement = entry[CONST_UNIT]
+            self._attr_icon = "mdi:wave-arrow-up"
+            self._attr_device_class = SensorDeviceClass.DISTANCE
+        elif entry[CONST_MEAS_CODE] == "WATHTEVERWACHT_LW":
+            self._attr_native_unit_of_measurement = entry[CONST_UNIT]
+            self._attr_icon = "mdi:wave-arrow-down"
+            self._attr_device_class = SensorDeviceClass.DISTANCE
         else:
             self._attr_native_unit_of_measurement = entry[CONST_UNIT]
             self._attr_icon = "mdi:water-circle"
@@ -190,6 +198,17 @@ class WaterInfoMetingSensor(SensorEntity):
 
 def collectObservation(data) -> dict:
     """Collect last measurement for given location/measurement."""
+    # For the verwachte waterhoogte we have to make a manual call
+    if "WATHTEVERWACHT" in data["Grootheid.Code"]:
+        is_low_tide = "LW" in data["Grootheid.Code"]
+        observation = get_wathteverwacht(data, data.Code, low_tide=is_low_tide)
+        if observation is not None:
+            data["observation"] = observation["Waarde"].iloc[0]
+            data["tijdstip"] = observation.index[0]
+        else:
+            data["observation"] = None
+            data["tijdstip"] = None
+        return data
 
     observation = ddlpy.measurements_latest(data)
 
