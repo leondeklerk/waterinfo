@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
-from datetime import datetime as dt, timedelta, timezone
 import logging
+from datetime import datetime as dt
+from datetime import timedelta, timezone
 
 import ddlpy
+import numpy as np
 import pandas as pd
-
 from homeassistant.components.sensor import (
     SensorDeviceClass,
     SensorEntity,
@@ -18,6 +19,7 @@ from homeassistant.const import UnitOfTemperature
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.device_registry import DeviceEntryType, DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from scipy.signal import find_peaks, savgol_filter
 
 from .const import (
     ATTR_LAST_CHECK,
@@ -26,6 +28,7 @@ from .const import (
     CONST_COORD,
     CONST_DEVICE_UNIQUE,
     CONST_ENABLE,
+    CONST_GROUP_CODE,
     CONST_LAT,
     CONST_LOC_CODE,
     CONST_LOC_NAME,
@@ -33,11 +36,14 @@ from .const import (
     CONST_MEAS_CODE,
     CONST_MEAS_DESCR,
     CONST_MEAS_NAME,
+    CONST_PROCES_TYPE,
     CONST_PROP,
     CONST_SENSOR,
     CONST_SENSOR_UNIQUE,
     CONST_UNIT,
     DOMAIN,
+    TIDE_SENSOR_CALCULATED,
+    TIDE_SENSOR_FORECAST,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -102,6 +108,12 @@ class WaterInfoMetingSensor(SensorEntity):
         self._name = entry[CONST_LOC_NAME]
         self._comp_code = entry[CONST_COMP_CODE]
         self._attr_unique_id = entry[CONST_DEVICE_UNIQUE] + entry[CONST_SENSOR_UNIQUE]
+        self._process_type = entry[CONST_PROCES_TYPE]
+        self._sensor_unique = entry[CONST_SENSOR_UNIQUE]
+
+        self._groepering = None
+        if CONST_GROUP_CODE in entry:
+            self._groepering = entry[CONST_GROUP_CODE]
 
         self._attr_state_class = SensorStateClass.MEASUREMENT
 
@@ -131,6 +143,20 @@ class WaterInfoMetingSensor(SensorEntity):
         elif entry[CONST_MEAS_CODE] in ("HTE3", "H1/3", "Hm0", "HEFHTE"):
             self._attr_native_unit_of_measurement = entry[CONST_UNIT]
             self._attr_icon = "mdi:signal-distance-variant"
+            self._attr_device_class = SensorDeviceClass.DISTANCE
+        elif (
+            entry[CONST_SENSOR_UNIQUE] == TIDE_SENSOR_CALCULATED + "_LW"
+            or entry[CONST_SENSOR_UNIQUE] == TIDE_SENSOR_FORECAST + "_LW"
+        ):
+            self._attr_native_unit_of_measurement = entry[CONST_UNIT]
+            self._attr_icon = "mdi:wave-arrow-down"
+            self._attr_device_class = SensorDeviceClass.DISTANCE
+        elif (
+            entry[CONST_SENSOR_UNIQUE] == TIDE_SENSOR_CALCULATED + "_HW"
+            or entry[CONST_SENSOR_UNIQUE] == TIDE_SENSOR_FORECAST + "_HW"
+        ):
+            self._attr_native_unit_of_measurement = entry[CONST_UNIT]
+            self._attr_icon = "mdi:wave-arrow-up"
             self._attr_device_class = SensorDeviceClass.DISTANCE
         elif entry[CONST_MEAS_CODE] == "WATHTE":
             self._attr_native_unit_of_measurement = entry[CONST_UNIT]
@@ -175,7 +201,25 @@ class WaterInfoMetingSensor(SensorEntity):
 
         location = pd.Series(selected)
 
-        await self.hass.async_add_executor_job(collectObservation, location)
+        if self._sensor_unique.startswith(TIDE_SENSOR_CALCULATED):
+            if (self._groepering is not None) and (self._groepering != ""):
+                location["Groepering.Code"] = self._groepering
+
+            if (self._process_type is not None) and (self._process_type != ""):
+                location["ProcesType"] = self._process_type
+
+            await self.hass.async_add_executor_job(
+                collectCalculatedTideObservation, location, self._sensor_unique.endswith("_LW")
+            )
+        elif self._sensor_unique.startswith(TIDE_SENSOR_FORECAST):
+            if (self._process_type is not None) and (self._process_type != ""):
+                location["ProcesType"] = self._process_type
+
+            await self.hass.async_add_executor_job(
+                collectForecastTideObservation, location, self._sensor_unique.endswith("_LW")
+            )
+        else:
+            await self.hass.async_add_executor_job(collectObservation, location)
 
         # if location["observation"] is not None and location["observation"] != "nan":
         if isinstance(location["observation"], float):
@@ -183,9 +227,7 @@ class WaterInfoMetingSensor(SensorEntity):
             self._last_data = location["tijdstip"]
             self._last_check = dt.now(timezone.utc)
 
-            _LOGGER.debug(
-                "Observation %s at %s", location["observation"], location["tijdstip"]
-            )
+            _LOGGER.debug("Observation %s at %s", location["observation"], location["tijdstip"])
 
 
 def collectObservation(data) -> dict:
@@ -224,5 +266,85 @@ def collectObservation(data) -> dict:
         data["tijdstip"] = None
 
         _LOGGER.error("No data for %s at %s", data["Grootheid.Code"], data["Naam"])
+
+    return data
+
+
+def collectCalculatedTideObservation(data, is_low_tide: bool) -> dict:
+    """Collect last calculated tide measurement for a given location (astronomical via GETETBRKD2)."""
+    try:
+        # According to documentation we need to start from 10 minutes ago until at most 2 days in the future
+        # One day should be enough to get the next low and high tide
+        observations = ddlpy.measurements(
+            data,
+            start_date=dt.now(tz=timezone.utc) - timedelta(minutes=10),
+            end_date=dt.now(tz=timezone.utc) + timedelta(days=1),
+        )
+        observations = ddlpy.simplify_dataframe(observations)
+
+        first_two = observations.head(2)
+        if is_low_tide:
+            idx = int(first_two["Meetwaarde.Waarde_Numeriek"].argmin())
+        else:
+            idx = int(first_two["Meetwaarde.Waarde_Numeriek"].argmax())
+
+        data["observation"] = observations["Meetwaarde.Waarde_Numeriek"].iloc[idx]
+        data["tijdstip"] = observations.index[idx].to_pydatetime()
+    except Exception:
+        data["observation"] = None
+        data["tijdstip"] = None
+
+        _LOGGER.error("No data for %s at %s", TIDE_SENSOR_CALCULATED, data["Naam"])
+
+    return data
+
+
+def collectForecastTideObservation(data, is_low_tide: bool) -> dict:
+    """Collect the next forecasted tides for a given location (calculated on the forecasted datapoints)."""
+    try:
+        observations = ddlpy.measurements(
+            data,
+            start_date=dt.now() - timedelta(minutes=10),
+            end_date=dt.now() + timedelta(days=1),
+        )
+        observations = ddlpy.simplify_dataframe(observations)
+
+        if observations.empty or "Meetwaarde.Waarde_Numeriek" not in observations.columns:
+            raise ValueError("No observation data available")
+
+        values = observations["Meetwaarde.Waarde_Numeriek"].to_numpy()
+
+        # Savitzky-Golay filter parameters:
+        # window_length: must be odd, ~1-2 hours of data points
+        # polyorder: polynomial order (3 works well for tidal curves)
+        window_length = min(13, len(values) if len(values) % 2 == 1 else len(values) - 1)
+        if window_length < 5:
+            raise ValueError("Not enough data points for smoothing")
+
+        smoothed: np.ndarray = savgol_filter(values, window_length=window_length, polyorder=3)
+
+        peak_params = {
+            "distance": 24,  # 4 hours minimum between extremes
+            "prominence": 10,  # 10 cm minimum prominence
+            "width": 3,  # peak must span at least 3 points
+        }
+
+        if is_low_tide:
+            # Find troughs by inverting the signal
+            indices, _ = find_peaks(-smoothed, **peak_params)
+        else:
+            indices, _ = find_peaks(smoothed, **peak_params)
+
+        if len(indices) == 0:
+            raise ValueError("No tide extremes found")
+
+        idx = int(indices[0])
+        data["observation"] = observations["Meetwaarde.Waarde_Numeriek"].iloc[idx]
+        data["tijdstip"] = observations.index[idx].to_pydatetime()
+
+    except Exception:
+        data["observation"] = None
+        data["tijdstip"] = None
+        _LOGGER.error("No data for %s at %s", TIDE_SENSOR_FORECAST, data["Naam"])
 
     return data

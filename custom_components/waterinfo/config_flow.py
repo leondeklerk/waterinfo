@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-from datetime import datetime as dt, timedelta
 import logging
+from datetime import datetime as dt
+from datetime import timedelta
 from typing import Any
 
 import ddlpy
 import voluptuous as vol
-
 from homeassistant.config_entries import (
     ConfigEntry,
     ConfigFlow,
@@ -24,6 +24,7 @@ from .const import (
     CONST_COMP_CODE,
     CONST_COORD,
     CONST_ENABLE,
+    CONST_GROUP_CODE,
     CONST_LAT,
     CONST_LOC_CODE,
     CONST_LOC_NAME,
@@ -41,6 +42,8 @@ from .const import (
     DOMAIN,
     MIN_TIMEDELTA,
     OPT_TIMEDELTA,
+    TIDE_SENSOR_CALCULATED,
+    TIDE_SENSOR_FORECAST,
 )
 from .locations import CONF_LOC_OPTIONS
 
@@ -74,22 +77,33 @@ def validate_location(data) -> dict:
     for x in range((len(selected) - 1), -1, -1):
         grootheid = selected.iloc[x]["Grootheid.Code"]
         hoedanigheid = selected.iloc[x]["Hoedanigheid.Code"]
+        groepering = selected.iloc[x]["Groepering.Code"]
+        processType = selected.iloc[x]["ProcesType"]
 
         if hoedanigheid != "NVT":
             sensorKey = grootheid + hoedanigheid
         else:
             sensorKey = grootheid
 
-        # Store all nessecary data for later
+        # If there are tide calculations, update the key as the grootheid and hoedanigheid are the same
+        # This is only present for WATHTE astronomisch
+        # If this is present we need to retrieve data differently and for two sensors (low/high tide)
+        if grootheid == "WATHTE" and processType == "astronomisch" and groepering == "GETETBRKD2":
+            sensorKey = TIDE_SENSOR_CALCULATED
+
+        # For the WATHTE verwachting there are no pre-calculated tide points.
+        # If verwachting is available we need to calculate it manually, so we add a unique name
+        if grootheid == "WATHTE" and processType == "verwachting":
+            sensorKey = TIDE_SENSOR_FORECAST
+
+        # Store all necessary data for later
         # There are some weird measurements and some measurements are duplicates
         if grootheid != "NVT" and sensorKey not in seen:
             device_info = {}
             device_info[CONST_LOC_NAME] = selected.iloc[x]["Naam"]
             device_info[CONST_MEAS_CODE] = grootheid
             device_info[CONST_MEAS_NAME] = selected.iloc[x]["Grootheid.Omschrijving"]
-            device_info[CONST_MEAS_DESCR] = selected.iloc[x][
-                "Parameter_Wat_Omschrijving"
-            ]
+            device_info[CONST_MEAS_DESCR] = selected.iloc[x]["Parameter_Wat_Omschrijving"]
             device_info[CONST_UNIT] = selected.iloc[x]["Eenheid.Code"]
             device_info[CONST_LONG] = selected.iloc[x]["Lon"]
             device_info[CONST_LAT] = selected.iloc[x]["Lat"]
@@ -105,11 +119,11 @@ def validate_location(data) -> dict:
             else:
                 device_info[CONST_MULTIPLIER] = 1
 
-            if grootheid in ("WATHTBRKD", "WATHTEASTRO"):
+            if grootheid in ("WATHTBRKD", "WATHTEASTRO") or processType == "astronomisch":
                 device_info[CONST_PROCES_TYPE] = "astronomisch"
                 device_info[CONST_ENABLE] = 0
-            elif grootheid in ("WATHTEVERWACHT", "QVERWACHT"):
-                device_info[CONST_PROCES_TYPE] = "verwacht"
+            elif grootheid in ("WATHTEVERWACHT", "QVERWACHT") or processType == "verwachting":
+                device_info[CONST_PROCES_TYPE] = "verwachting"
                 device_info[CONST_ENABLE] = 0
             else:
                 device_info[CONST_PROCES_TYPE] = "meting"
@@ -119,23 +133,48 @@ def validate_location(data) -> dict:
             if device_info[CONST_ENABLE] == 1:
                 end_date = dt.today()
                 start_date = end_date - timedelta(days=DEFAULT_TIMEDELTA)
-                measurements = ddlpy.measurements(
-                    selected.iloc[x], start_date=start_date, end_date=end_date
-                )
+                measurements = ddlpy.measurements(selected.iloc[x], start_date=start_date, end_date=end_date)
 
                 # if not, disabled
                 if measurements.empty:
                     device_info[CONST_ENABLE] = 0
 
+            # If it is a GET_WATHTBRKD or GET_WATHTEVERWACHT sensor we need to add two sensors instead
+            if sensorKey == TIDE_SENSOR_CALCULATED or sensorKey == TIDE_SENSOR_FORECAST:
+                if groepering != "NVT" and groepering != "":
+                    device_info[CONST_GROUP_CODE] = groepering
+
+                code_lw = sensorKey + "_LW"
+                code_hw = sensorKey + "_HW"
+
+                tide_name_prefix = "Astronomisch" if sensorKey == TIDE_SENSOR_CALCULATED else "Verwacht"
+                tide_description_type = (
+                    "astronomische berekeningen" if sensorKey == TIDE_SENSOR_CALCULATED else "weersvoorspellingen"
+                )
+
+                device_info_low = device_info.copy()
+                device_info_low[CONST_MEAS_NAME] = tide_name_prefix + " Laagwater"
+                device_info_low[CONST_MEAS_DESCR] = "Voorspelt laagwater op basis van " + tide_description_type
+                device_info_low[CONST_SENSOR_UNIQUE] = code_lw
+                sensoren.append(device_info_low)
+
+                device_info_high = device_info.copy()
+                device_info_high[CONST_MEAS_NAME] = tide_name_prefix + " Hoogwater"
+                device_info_high[CONST_MEAS_DESCR] = "Voorspelt hoogwater op basis van " + tide_description_type
+                device_info_high[CONST_SENSOR_UNIQUE] = code_hw
+                sensoren.append(device_info_high)
+
+            else:
+                sensoren.append(device_info)
+
             seen.append(sensorKey)
-            sensoren.append(device_info)
 
     data[CONST_SENSOR] = sensoren
     data[CONST_LOC_NAME] = selected.iloc[x]["Naam"]
 
     _LOGGER.info(
         "Made %s sensors for %s (location %s)",
-        len(seen),
+        len(sensoren),
         data[CONST_LOC_NAME],
         data[CONST_LOC_CODE],
     )
@@ -156,9 +195,7 @@ class WaterinfoConfigFlow(ConfigFlow, domain=DOMAIN):
         # if you do not want any options for your integration.
         return WaterInfoFlowHandler(config_entry)
 
-    async def async_step_user(
-        self, user_input: dict[str, Any] | None = None
-    ) -> ConfigFlowResult:
+    async def async_step_user(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
         """Handle a flow initialized by the user."""
         errors: dict[str, str] = {}
 
@@ -203,18 +240,14 @@ class WaterinfoConfigFlow(ConfigFlow, domain=DOMAIN):
     # Reconfigure means a new location, which is new data
     # So instead of reconfigure, just make a new entry
 
-    async def async_step_reconfigure(
-        self, user_input: dict[str, Any] | None = None
-    ) -> ConfigFlowResult:
+    async def async_step_reconfigure(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
         """Add reconfigure step to allow to reconfigure a config entry."""
         # This methid displays a reconfigure option in the integration and is
         # different to options.
         # It can be used to reconfigure any of the data submitted when first installed.
         # This is optional and can be removed if you do not want to allow reconfiguration.
         errors: dict[str, str] = {}
-        config_entry = self.hass.config_entries.async_get_entry(
-            self.context["entry_id"]
-        )
+        config_entry = self.hass.config_entries.async_get_entry(self.context["entry_id"])
 
         if user_input is not None:
             try:
@@ -231,9 +264,7 @@ class WaterinfoConfigFlow(ConfigFlow, domain=DOMAIN):
             step_id="reconfigure",
             data_schema=vol.Schema(
                 {
-                    vol.Required(
-                        CONST_LOC_CODE, default=config_entry.unique_id
-                    ): selector(
+                    vol.Required(CONST_LOC_CODE, default=config_entry.unique_id): selector(
                         {
                             "select": {
                                 "options": CONF_LOC_OPTIONS,
