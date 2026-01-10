@@ -302,9 +302,10 @@ def collectCalculatedTideObservation(data, is_low_tide: bool) -> dict:
 def collectForecastTideObservation(data, is_low_tide: bool) -> dict:
     """Collect the next forecasted tides for a given location (calculated on the forecasted datapoints)."""
     try:
+        # To make sure we can catch an ongoing tide we start 6 hours back and go 1 day forward
         observations = ddlpy.measurements(
             data,
-            start_date=dt.now() - timedelta(minutes=10),
+            start_date=dt.now() - timedelta(hours=6),
             end_date=dt.now() + timedelta(days=1),
         )
         observations = ddlpy.simplify_dataframe(observations)
@@ -337,6 +338,10 @@ def collectForecastTideObservation(data, is_low_tide: bool) -> dict:
 
         if len(indices) == 0:
             raise ValueError("No tide extremes found")
+
+        # make sure the found peak is at a time larger or equal than the current time (accounting for timezones)
+        current_time = dt.now(timezone.utc)
+        indices = [i for i in indices if observations.index[i] >= current_time]
 
         idx = int(indices[0])
         data["observation"] = observations["Meetwaarde.Waarde_Numeriek"].iloc[idx]
